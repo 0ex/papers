@@ -1,0 +1,106 @@
+name: Import Saunders 2026 paper
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/import-saunders-30598.yml
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Download retained extraction artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api repos/$GITHUB_REPOSITORY/actions/artifacts/8621838490/zip > /tmp/philsci.zip
+          mkdir -p /tmp/philsci
+          unzip -q /tmp/philsci.zip philsci-30598-v3.md -d /tmp/philsci
+
+      - name: Normalize exact requested Markdown
+        run: |
+          set -euo pipefail
+          mkdir -p in
+          python - <<'PY'
+          from pathlib import Path
+
+          raw = Path('/tmp/philsci/philsci-30598-v3.md').read_text(encoding='utf-8').splitlines()
+          raw = [line.rstrip() for line in raw]
+          start = next(i for i, line in enumerate(raw) if line.startswith('Abstract : '))
+          body = [raw[start][len('Abstract : '):], *raw[start + 1:]]
+
+          replacements = {
+              '1. Introduction': '## 1. Introduction',
+              '2. Local Causality and LOC': '## 2. Local Causality and LOC',
+              '3. The theory 𝜆 -MANY 8': '## 3. The theory 𝜆 -MANY',
+              '4. 𝝀 -MANY and Parameter Independence': '## 4. 𝝀 -MANY and Parameter Independence',
+              '5. 𝝀 -MANY and Outcome Independence': '## 5. 𝝀 -MANY and Outcome Independence',
+              '6. What Bell did': '## 6. What Bell did',
+              'Acknowledgments': '## Acknowledgments',
+              'References': '## References',
+          }
+
+          clean = []
+          skip_blank = False
+          for line in body:
+              if line in {'3', '16'}:
+                  skip_blank = True
+                  continue
+              if skip_blank and line == '':
+                  skip_blank = False
+                  continue
+              skip_blank = False
+              clean.append(replacements.get(line, line))
+
+          header = '''---
+          title: "Physical Probability in the Everett Interpretation and Bell Inequalities"
+          author: "Simon Saunders"
+          source: "PhilSci-Archive item 30598"
+          source_version: "v3"
+          deposited: "2026-07-23"
+          source_pages: 31
+          conversion: "Jina Reader PDF text extraction, lightly normalized"
+          ---
+
+          # Physical Probability in the Everett Interpretation and Bell Inequalities
+
+          **Simon Saunders**
+
+          > **Conversion note.** This is a text extraction of the PhilSci-Archive v3 PDF. Equations and mathematical symbols are retained as Unicode text in their original extracted positions. The PDF's embedded mathematical fonts do not map perfectly to Unicode, so a few symbols, subscripts, superscripts, and summation/integration signs may be imperfect. No equation content was silently rewritten or guessed.
+
+          ## Abstract
+
+          '''
+          # Remove YAML indentation introduced by the workflow block.
+          header = '\n'.join(line[10:] if line.startswith('          ') else line for line in header.splitlines())
+          output = header + '\n'.join(clean) + '\n'
+          target = Path('in/saunders-2026-prob-v3.md')
+          target.write_text(output, encoding='utf-8')
+
+          expected = 'c197a39b55c349415b2a684d3d338a20822eef348f81338d3ae317f33167ab78'
+          import hashlib
+          actual = hashlib.sha256(target.read_bytes()).hexdigest()
+          if actual != expected:
+              raise SystemExit(f'hash mismatch: expected {expected}, got {actual}')
+          PY
+
+      - name: Commit paper and remove importer
+        run: |
+          set -euo pipefail
+          rm .github/workflows/import-saunders-30598.yml
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add in/saunders-2026-prob-v3.md .github/workflows/import-saunders-30598.yml
+          git commit -m "Add Saunders 2026 paper"
+          git push origin main
