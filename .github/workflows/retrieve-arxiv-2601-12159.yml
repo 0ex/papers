@@ -1,0 +1,97 @@
+name: Retrieve arXiv source 2601.12159
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  retrieve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download and unpack arXiv source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p arxiv-source output
+          curl -fL --retry 4 --retry-delay 2 -A 'Mozilla/5.0' \
+            'https://export.arxiv.org/e-print/2601.12159' -o output/arxiv-2601.12159-source.tar || \
+          curl -fL --retry 4 --retry-delay 2 -A 'Mozilla/5.0' \
+            'https://arxiv.org/e-print/2601.12159' -o output/arxiv-2601.12159-source.tar
+          file output/arxiv-2601.12159-source.tar | tee output/source-file-type.txt
+          tar -xf output/arxiv-2601.12159-source.tar -C arxiv-source
+          find arxiv-source -maxdepth 4 -type f -printf '%P\t%s bytes\n' | sort | tee output/source-files.txt
+          cp -a arxiv-source output/source
+
+      - name: Make expanded TeX and Markdown
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y pandoc latexml texlive-extra-utils
+          main="$(grep -ril --include='*.tex' '\\documentclass' arxiv-source | head -1)"
+          test -n "$main"
+          printf '%s\n' "$main" > output/main-tex-path.txt
+          latexpand "$main" > output/arxiv-2601.12159-expanded.tex
+          pandoc output/arxiv-2601.12159-expanded.tex \
+            --from=latex --to=gfm --wrap=none --markdown-headings=atx \
+            -o output/arxiv-2601.12159.md
+          latexmlc --format=html5 --mathimages --dest=output/arxiv-2601.12159.html "$main" || true
+
+      - name: Equation inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          tex_path = Path('output/arxiv-2601.12159-expanded.tex')
+          if not tex_path.exists():
+              tex_files = list(Path('arxiv-source').rglob('*.tex'))
+              tex_path = tex_files[0]
+          text = tex_path.read_text(encoding='utf-8', errors='replace')
+          envs = re.findall(
+              r'\\begin\{(equation\*?|align\*?|gather\*?|multline\*?|displaymath)\}(.*?)\\end\{\1\}',
+              text,
+              flags=re.S,
+          )
+          numbered = []
+          for env, body in envs:
+              label = re.search(r'\\label\{([^}]+)\}', body)
+              numbered.append({'environment': env, 'label': label.group(1) if label else None, 'tex': body.strip()})
+          Path('output/equations.json').write_text(json.dumps(numbered, indent=2), encoding='utf-8')
+          Path('output/equation-count.txt').write_text(str(len(numbered)) + '\n', encoding='utf-8')
+          print(f'Found {len(numbered)} display environments')
+          PY
+
+      - name: Upload source conversion
+        uses: actions/upload-artifact@v4
+        with:
+          name: arxiv-2601-12159-source
+          retention-days: 7
+          if-no-files-found: error
+          path: output/
+
+      - name: Publish source output branch
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git switch --orphan arxiv-source-output-2601-12159
+          git rm -rf . >/dev/null 2>&1 || true
+          git add -f output
+          git commit -m 'Add arXiv 2601.12159 source conversion'
+          git push --force origin HEAD:refs/heads/arxiv-source-output-2601-12159
