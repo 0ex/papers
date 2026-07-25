@@ -1,0 +1,113 @@
+name: Convert arXiv PDF 2601.12159
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download current arXiv PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/marker
+          curl -fL --retry 4 --retry-delay 2 -A 'Mozilla/5.0' \
+            'https://arxiv.org/pdf/2601.12159' -o output/arxiv-2601.12159v2.pdf
+          head -c 4 output/arxiv-2601.12159v2.pdf | grep -q '%PDF'
+          pdfinfo output/arxiv-2601.12159v2.pdf > output/pdfinfo.txt
+          pdftotext -layout output/arxiv-2601.12159v2.pdf output/arxiv-2601.12159v2-layout.txt
+          sha256sum output/arxiv-2601.12159v2.pdf > output/pdf-sha256.txt
+
+      - name: Install Marker
+        id: marker_install
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --no-cache-dir marker-pdf
+
+      - name: Convert with Marker
+        if: steps.marker_install.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          marker_single --help > output/marker-help.txt 2>&1
+          args=(output/arxiv-2601.12159v2.pdf --output_dir output/marker --output_format markdown)
+          if grep -q -- '--force_ocr' output/marker-help.txt; then
+            args+=(--force_ocr)
+          fi
+          if grep -q -- '--paginate_output' output/marker-help.txt; then
+            args+=(--paginate_output)
+          fi
+          TORCH_DEVICE=cpu marker_single "${args[@]}" 2>&1 | tee output/marker.log
+          echo "${PIPESTATUS[0]}" > output/marker-exit-status.txt
+          exit 0
+
+      - name: Select and check Markdown
+        shell: bash
+        run: |
+          set -euo pipefail
+          marker_md="$(find output/marker -type f -name '*.md' -size +1000c -print -quit 2>/dev/null || true)"
+          if [[ -n "$marker_md" ]]; then
+            cp "$marker_md" output/arxiv-2601.12159v2.md
+            printf 'marker\n' > output/selected-converter.txt
+          else
+            cp output/arxiv-2601.12159v2-layout.txt output/arxiv-2601.12159v2.md
+            printf 'pdftotext-layout\n' > output/selected-converter.txt
+          fi
+          python - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+          p = Path('output/arxiv-2601.12159v2.md')
+          text = p.read_text(encoding='utf-8', errors='replace')
+          report = {
+              'bytes': p.stat().st_size,
+              'lines': text.count('\n') + 1,
+              'display_math_delimiters': text.count('$$'),
+              'inline_math_delimiters': text.count('$'),
+              'latex_commands': len(re.findall(r'\\[A-Za-z]+', text)),
+              'equation_environments': len(re.findall(r'\\begin\{(?:equation|align|gather|multline)', text)),
+              'unicode_math_symbols': sum(text.count(c) for c in '∑ΣψΨρλ αβ⟨⟩⊗→⇒¬∧∨≤≥'),
+          }
+          Path('output/conversion-report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+          print(json.dumps(report, indent=2))
+          PY
+
+      - name: Upload conversion
+        uses: actions/upload-artifact@v4
+        with:
+          name: arxiv-2601-12159v2-conversion
+          retention-days: 7
+          if-no-files-found: error
+          path: output/
+
+      - name: Publish conversion output branch
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git switch --orphan arxiv-conversion-output-2601-12159
+          git rm -rf . >/dev/null 2>&1 || true
+          git add -f output
+          git commit -m 'Add arXiv 2601.12159 v2 conversion'
+          git push --force origin HEAD:refs/heads/arxiv-conversion-output-2601-12159
