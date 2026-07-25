@@ -1,0 +1,178 @@
+name: Convert PhilSci paper 30598
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/convert-philsci-30598.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Locate and download current v3 PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import html
+          import json
+          import re
+          import sys
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+
+          item_url = "https://philsci-archive.pitt.edu/30598/"
+          reader_url = "https://r.jina.ai/" + item_url
+          headers = {
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
+          }
+
+          page = requests.get(reader_url, headers=headers, timeout=180)
+          page.raise_for_status()
+          Path("item-page.md").write_text(page.text, encoding="utf-8")
+
+          matches = re.findall(r"\[([^\]]*)\]\((https?://[^)]+)\)", page.text)
+          candidates = []
+          for label, url in matches:
+              url = html.unescape(url).replace("\\_", "_")
+              if ".pdf" in url.lower():
+                  candidates.append((label, urljoin(item_url, url)))
+
+          if not candidates:
+              bare = re.findall(r"https?://[^\s<>()\]]+\.pdf(?:\?[^\s<>()\]]*)?", page.text, flags=re.I)
+              candidates = [("", html.unescape(url)) for url in bare]
+
+          seen = set()
+          candidates = [(label, url) for label, url in candidates if not (url in seen or seen.add(url))]
+          if not candidates:
+              print(page.text[:10000], file=sys.stderr)
+              raise RuntimeError("No PDF link found on the item page")
+
+          preferred = [c for c in candidates if "v3" in (c[0] + " " + c[1]).lower()]
+          label, pdf_url = (preferred or candidates)[0]
+
+          response = requests.get(pdf_url, headers=headers, timeout=300, allow_redirects=True)
+          response.raise_for_status()
+          if not response.content.startswith(b"%PDF"):
+              raise RuntimeError(f"Downloaded file is not a PDF: {response.headers.get('content-type')}")
+          Path("source.pdf").write_bytes(response.content)
+
+          metadata = {
+              "item_url": item_url,
+              "page_via": reader_url,
+              "selected_label": label,
+              "pdf_url": pdf_url,
+              "pdf_candidates": candidates,
+              "pdf_size_bytes": len(response.content),
+          }
+          Path("source.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+          Path("pdf-url.txt").write_text(pdf_url + "\n", encoding="utf-8")
+          print(json.dumps(metadata, indent=2))
+          PY
+
+      - name: Produce Jina PDF extraction
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import requests
+
+          pdf_url = json.loads(Path("source.json").read_text())["pdf_url"]
+          response = requests.get("https://r.jina.ai/" + pdf_url, timeout=600)
+          response.raise_for_status()
+          Path("paper-jina.md").write_text(response.text, encoding="utf-8")
+          PY
+
+      - name: Install equation-aware converter
+        id: marker_install
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --no-cache-dir marker-pdf
+
+      - name: Convert PDF with Marker
+        if: steps.marker_install.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p marker-output
+          marker_single --help > marker-help.txt 2>&1
+          args=(source.pdf --output_dir marker-output --output_format markdown)
+          if grep -q -- '--paginate_output' marker-help.txt; then
+            args+=(--paginate_output)
+          fi
+          if grep -q -- '--force_ocr' marker-help.txt; then
+            args+=(--force_ocr)
+          fi
+          TORCH_DEVICE=cpu marker_single "${args[@]}" 2>&1 | tee marker.log
+          echo "${PIPESTATUS[0]}" > marker-exit-status.txt
+          exit 0
+
+      - name: Prepare output
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf conversion
+          mkdir -p conversion/marker
+          cp source.pdf conversion/philsci-30598-v3.pdf
+          cp source.json item-page.md paper-jina.md conversion/
+          cp -a marker-output/. conversion/marker/ 2>/dev/null || true
+
+          marker_md="$(find marker-output -type f -name '*.md' -size +1000c -print -quit 2>/dev/null || true)"
+          if [[ -n "$marker_md" ]]; then
+            cp "$marker_md" conversion/philsci-30598-v3.md
+            printf 'marker\n' > conversion/selected-converter.txt
+          else
+            cp paper-jina.md conversion/philsci-30598-v3.md
+            printf 'jina\n' > conversion/selected-converter.txt
+          fi
+
+          python - <<'PY'
+          import re
+          from pathlib import Path
+          p = Path("conversion/philsci-30598-v3.md")
+          text = p.read_text(encoding="utf-8", errors="replace")
+          stats = {
+              "bytes": p.stat().st_size,
+              "lines": text.count("\n") + 1,
+              "display_math_delimiters": text.count("$$"),
+              "latex_commands": len(re.findall(r"\\[A-Za-z]+", text)),
+              "equation_environments": len(re.findall(r"\\begin\{(?:equation|align|gather|multline)", text)),
+          }
+          Path("conversion/conversion-stats.json").write_text(__import__("json").dumps(stats, indent=2), encoding="utf-8")
+          print(stats)
+          PY
+
+      - name: Publish temporary output branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git switch --orphan conversion-output-30598
+          git rm -rf . >/dev/null 2>&1 || true
+          git add -f conversion
+          git commit -m "Add PhilSci 30598 v3 conversion"
+          git push --force origin HEAD:refs/heads/conversion-output-30598
