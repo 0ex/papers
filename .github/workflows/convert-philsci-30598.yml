@@ -1,0 +1,154 @@
+name: Convert PhilSci paper 30598
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Locate and download v3 PDF
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import html
+          import json
+          import re
+          import sys
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+
+          item_url = "https://philsci-archive.pitt.edu/30598/"
+          reader_url = "https://r.jina.ai/" + item_url
+          headers = {
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
+          }
+
+          page = requests.get(reader_url, headers=headers, timeout=180)
+          page.raise_for_status()
+          Path("item-page.md").write_text(page.text, encoding="utf-8")
+
+          matches = re.findall(r"\[([^\]]*)\]\((https?://[^)]+)\)", page.text)
+          candidates = []
+          for label, url in matches:
+              url = html.unescape(url).replace("\\_", "_")
+              if ".pdf" in url.lower():
+                  candidates.append((label, urljoin(item_url, url)))
+
+          if not candidates:
+              bare = re.findall(r"https?://[^\s<>()\]]+\.pdf(?:\?[^\s<>()\]]*)?", page.text, flags=re.I)
+              candidates = [("", html.unescape(url)) for url in bare]
+
+          # Preserve order while removing duplicate URLs.
+          seen = set()
+          candidates = [(label, url) for label, url in candidates if not (url in seen or seen.add(url))]
+          if not candidates:
+              print(page.text[:6000], file=sys.stderr)
+              raise RuntimeError("No PDF link found on the item page")
+
+          preferred = [c for c in candidates if "v3" in (c[0] + " " + c[1]).lower()]
+          label, pdf_url = (preferred or candidates)[0]
+
+          response = requests.get(pdf_url, headers=headers, timeout=300, allow_redirects=True)
+          response.raise_for_status()
+          if not response.content.startswith(b"%PDF"):
+              raise RuntimeError(f"Downloaded file is not a PDF: {response.headers.get('content-type')}")
+          Path("source.pdf").write_bytes(response.content)
+
+          metadata = {
+              "item_url": item_url,
+              "page_via": reader_url,
+              "selected_label": label,
+              "pdf_url": pdf_url,
+              "pdf_candidates": candidates,
+              "pdf_size_bytes": len(response.content),
+          }
+          Path("source.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+          Path("pdf-url.txt").write_text(pdf_url + "\n", encoding="utf-8")
+          with open("$GITHUB_OUTPUT", "a", encoding="utf-8") as out:
+              print(f"pdf_url={pdf_url}", file=out)
+          print(json.dumps(metadata, indent=2))
+          PY
+
+      - name: Produce fallback Markdown with Jina Reader
+        shell: bash
+        env:
+          PDF_URL: ${{ steps.source.outputs.pdf_url }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import requests
+
+          url = "https://r.jina.ai/" + os.environ["PDF_URL"]
+          response = requests.get(url, timeout=600)
+          response.raise_for_status()
+          Path("paper-jina.md").write_text(response.text, encoding="utf-8")
+          PY
+
+      - name: Install equation-aware converter
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --no-cache-dir marker-pdf
+
+      - name: Convert PDF to equation-aware Markdown
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p marker-output
+          marker_single --help > marker-help.txt 2>&1
+          args=(source.pdf --output_dir marker-output --output_format markdown --paginate_output)
+          if grep -q -- '--mode' marker-help.txt; then
+            args+=(--mode balanced)
+          fi
+          if grep -q -- '--force_ocr' marker-help.txt; then
+            args+=(--force_ocr)
+          fi
+          TORCH_DEVICE=cpu marker_single "${args[@]}" 2>&1 | tee marker.log
+          status=${PIPESTATUS[0]}
+          echo "$status" > marker-exit-status.txt
+          exit 0
+
+      - name: Summarize generated files
+        shell: bash
+        run: |
+          set -euo pipefail
+          find . -maxdepth 4 -type f -printf '%p\t%s bytes\n' | sort > files.txt
+          cat files.txt
+
+      - name: Upload conversion artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: philsci-30598-v3-conversion
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            item-page.md
+            source.json
+            pdf-url.txt
+            source.pdf
+            paper-jina.md
+            marker-output/
+            marker-help.txt
+            marker.log
+            marker-exit-status.txt
+            files.txt
