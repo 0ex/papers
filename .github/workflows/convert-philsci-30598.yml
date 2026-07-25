@@ -26,6 +26,7 @@ jobs:
           python - <<'PY'
           import html
           import json
+          import os
           import re
           import sys
           from pathlib import Path
@@ -54,7 +55,6 @@ jobs:
               bare = re.findall(r"https?://[^\s<>()\]]+\.pdf(?:\?[^\s<>()\]]*)?", page.text, flags=re.I)
               candidates = [("", html.unescape(url)) for url in bare]
 
-          # Preserve order while removing duplicate URLs.
           seen = set()
           candidates = [(label, url) for label, url in candidates if not (url in seen or seen.add(url))]
           if not candidates:
@@ -80,7 +80,7 @@ jobs:
           }
           Path("source.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
           Path("pdf-url.txt").write_text(pdf_url + "\n", encoding="utf-8")
-          with open("$GITHUB_OUTPUT", "a", encoding="utf-8") as out:
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               print(f"pdf_url={pdf_url}", file=out)
           print(json.dumps(metadata, indent=2))
           PY
@@ -103,6 +103,8 @@ jobs:
           PY
 
       - name: Install equation-aware converter
+        id: marker_install
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -111,6 +113,8 @@ jobs:
           python -m pip install --no-cache-dir marker-pdf
 
       - name: Convert PDF to equation-aware Markdown
+        if: steps.marker_install.outcome == 'success'
+        continue-on-error: true
         shell: bash
         run: |
           set -uo pipefail
@@ -132,6 +136,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p marker-output
+          touch marker-help.txt marker.log marker-exit-status.txt
           find . -maxdepth 4 -type f -printf '%p\t%s bytes\n' | sort > files.txt
           cat files.txt
 
